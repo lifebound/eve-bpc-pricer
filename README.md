@@ -6,6 +6,37 @@ A Python tool for determining fair market value of EVE Online Blueprint Copies u
 
 This tool helps EVE Online players determine the fair market value of Blueprint Copies (BPCs) by analyzing historical pricing data from the Adam4EVE API. Instead of calculating manufacturing profitability, it focuses on what BPCs are actually worth as tradeable items.
 
+## Why This Tool Exists
+
+Blueprint copies are one of the most opaque markets in EVE Online. Unlike normal
+items, BPCs never appear on the regional market—only on **contracts**. This
+means:
+
+- There is **no in-game price history** for BPCs.
+- You can only see **current contracts**, not what players actually paid.
+- Historical contract prices exist only through third-party services like
+  Adam4EVE, and even then the data is:
+  - sparse,
+  - irregular,
+  - split across many ME/TE/run combinations,
+  - and based solely on *completed* contracts.
+
+As a result, most players price BPCs by copying the lowest active contract or
+just guessing, which often leads to wildly inaccurate values.
+
+This tool attempts to fix that.
+
+It uses the historical record of **actual completed contracts** for each
+specific blueprint—each sale, at each price—to approximate what the EVE
+playerbase has collectively demonstrated they are willing to pay. With this
+approach, you can:
+
+- **Value BPCs from exploration loot** without guesswork
+- **Evaluate bulk contracts** by checking each included blueprint individually
+- **Price your own BPC listings** based on demonstrated market behavior
+- **Estimate the value of your BPC portfolio** in a consistent, explainable way
+
+
 ## Features
 
 - Fetch historical pricing data for BPCs from Adam4EVE

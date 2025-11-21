@@ -38,7 +38,7 @@ Examples:
     input_group.add_argument(
         "--bpc", 
         type=str,
-        help="Single BPC name to analyze (e.g., 'Raven Blueprint Copy')"
+        help="Single BPC name to analyze (e.g., 'Raven Blueprint Copy')" 
     )
     input_group.add_argument(
         "--csv",
