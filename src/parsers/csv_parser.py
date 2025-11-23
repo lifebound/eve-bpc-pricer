@@ -9,6 +9,7 @@ import pandas as pd
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from src.models.bpc import BPC, BPCType
+from src.models.bpc import BPCEfficiency
 
 
 class BPCCSVParser:
@@ -282,6 +283,15 @@ class BPCCSVParser:
             
             # Check if we have embedded efficiency data in description
             description = row.get('description', '')
+            # Parse explicit efficiency string if present
+            efficiency_str = row.get('bpc_efficiency', '')
+            efficiency_hint = None
+            if pd.notna(efficiency_str) and str(efficiency_str).strip():
+                try:
+                    efficiency_hint = BPCEfficiency.parse(str(efficiency_str).strip())
+                except ValueError:
+                    efficiency_hint = None
+
             if pd.notna(description) and 'Material Efficiency' in str(description):
                 # Parse efficiency from description
                 me_from_desc, te_from_desc, runs_from_desc = self._parse_efficiency_from_description(description)
@@ -289,6 +299,11 @@ class BPCCSVParser:
                 me_level = self._safe_parse_int(row.get('me_level'), default=me_from_desc, min_val=0, max_val=10)
                 te_level = self._safe_parse_int(row.get('te_level'), default=te_from_desc, min_val=0, max_val=20)
                 runs = self._safe_parse_int(row.get('runs'), default=runs_from_desc, min_val=1)
+            elif efficiency_hint:
+                # Use parsed efficiency string as defaults
+                me_level = self._safe_parse_int(row.get('me_level'), default=efficiency_hint.material_efficiency, min_val=0, max_val=10)
+                te_level = self._safe_parse_int(row.get('te_level'), default=efficiency_hint.time_efficiency, min_val=0, max_val=20)
+                runs = self._safe_parse_int(row.get('runs'), default=efficiency_hint.runs, min_val=1)
             else:
                 # Parse efficiency values with standard defaults
                 me_level = self._safe_parse_int(row.get('me_level'), default=0, min_val=0, max_val=10)

@@ -5,14 +5,19 @@ This module provides a client for fetching historical pricing data
 for Blueprint Copies from the Adam4EVE API using their actual endpoints.
 """
 
-import requests
-import time
+import logging
 import re
-from typing import Dict, List, Optional, Any, Tuple
+import time
 from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
+
+import requests
 from bs4 import BeautifulSoup
-from src.models.bpc import HistoricalPrice, BPCEfficiency
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from src.models.bpc import BPCEfficiency, HistoricalPrice
 
 
 class Adam4EveHistoricalClient:
@@ -27,9 +32,12 @@ class Adam4EveHistoricalClient:
         Args:
             rate_limit: Minimum seconds between API calls
         """
+        self.logger = logging.getLogger(__name__)
         self.rate_limit = rate_limit
         self.last_request_time = 0
         self.session = requests.Session()
+        self._configure_retries()
+        self._contract_page_cache = {}
         
         # Set user agent and other headers to mimic browser
         self.session.headers.update({
@@ -56,6 +64,48 @@ class Adam4EveHistoricalClient:
         
         self.last_request_time = time.time()
     
+    def _configure_retries(self):
+        """Configure HTTP retries with backoff for transient errors."""
+        retry = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET",),
+            raise_on_status=False
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+
+    def check_availability(self, timeout: int = 8):
+        """
+        Quick sanity check that Adam4EVE is reachable.
+        Raises an HTTPError if the site returns 4xx/5xx (e.g., 404 when down).
+        """
+        try:
+            resp = self.session.get(self.BASE_URL, timeout=timeout)
+            resp.raise_for_status()
+            return True
+        except requests.HTTPError as exc:
+            self.logger.error("Adam4EVE availability check failed: %s", exc)
+            raise
+        except Exception as exc:
+            self.logger.error("Adam4EVE availability check error: %s", exc)
+            raise
+    
+    def _request(self, url: str, params: Optional[Dict] = None, timeout: int = 10, expect_json: bool = False, headers: Optional[Dict[str, str]] = None):
+        """Perform a rate-limited GET with retries and logging."""
+        self._rate_limit_wait()
+        response = None
+        try:
+            response = self.session.get(url, params=params, timeout=timeout, headers=headers)
+            response.raise_for_status()
+            return response.json() if expect_json else response
+        except requests.RequestException as exc:
+            target = response.url if response is not None else url
+            self.logger.warning("Request to %s failed: %s", target, exc)
+            raise
+    
     def _make_request(self, endpoint: str, params: Optional[Dict] = None) -> Dict[str, Any]:
         """
         Make a rate-limited request to the Adam4EVE API.
@@ -67,13 +117,8 @@ class Adam4EveHistoricalClient:
         Returns:
             JSON response data
         """
-        self._rate_limit_wait()
-        
         url = f"{self.BASE_URL}/{endpoint}"
-        response = self.session.get(url, params=params)
-        response.raise_for_status()
-        
-        return response.json()
+        return self._request(url, params=params, expect_json=True)
     
     def search_bpc_by_name(self, bpc_name: str) -> Optional[int]:
         """
@@ -90,39 +135,28 @@ class Adam4EveHistoricalClient:
             search_terms = [
                 bpc_name,  # Original name
                 bpc_name.replace("'", ""),  # Remove quotes
-                bpc_name.replace("'", "'"),  # Try different quote style  
                 bpc_name.replace(" Blueprint", "")  # Try without "Blueprint"
             ]
             
-            for term in search_terms:
-                print(f"   Trying search term: '{term}'")
-                
-                # URL encode the search term
-                encoded_name = quote_plus(term)
-                
-                # Use Adam4EVE search endpoint
+            # De-duplicate while preserving order
+            for term in dict.fromkeys(search_terms):
+                # Use Adam4EVE search endpoint; let requests handle encoding
                 search_url = f"{self.BASE_URL}/ajax/search.php"
                 params = {
                     'item': 'contractItem',
-                    'term': encoded_name
+                    'term': term
                 }
-                
-                # Construct and print full URL for debugging
-                full_url = f"{search_url}?item={params['item']}&term={params['term']}"
-                print(f"   Full URL: {full_url}")
                 
                 # Add referer header for this request and use the full URL directly
                 headers = {'Referer': self.BASE_URL}
-                response = self.session.get(full_url, headers=headers)
-                response.raise_for_status()
-                
-                print(f"   Response: {response.text}")
-                
-                search_results = response.json()
+                try:
+                    search_results = self._request(search_url, params=params, timeout=8, expect_json=True, headers=headers)
+                except Exception as exc:
+                    self.logger.debug("Search term '%s' failed: %s", term, exc)
+                    continue
                 
                 # Return the first match's ID
                 if search_results and isinstance(search_results, list) and len(search_results) > 0:
-                    print(f"   Found matches: {search_results}")
                     first_result = search_results[0]
                     if 'id' in first_result:
                         return int(first_result['id'])
@@ -130,13 +164,12 @@ class Adam4EveHistoricalClient:
             # If all search terms failed, let's try a manual lookup
             # We know from your example that the item ID should be 23857
             if "'chivalry'" in bpc_name.lower():
-                print(f"   Using known item ID for Chivalry: 23857")
                 return 23857
             
             return None
             
         except Exception as e:
-            print(f"Error searching for BPC {bpc_name}: {e}")
+            self.logger.warning("Error searching for BPC %s: %s", bpc_name, e)
             return None
     
     def get_historical_prices(
@@ -145,7 +178,8 @@ class Adam4EveHistoricalClient:
         region: str = "The Forge",
         days_back: int = 30,
         me_level: Optional[int] = None,
-        te_level: Optional[int] = None
+        te_level: Optional[int] = None,
+        html_content: Optional[str] = None
     ) -> List[HistoricalPrice]:
         """
         Get historical price data for a BPC using Adam4EVE contract price page.
@@ -161,50 +195,34 @@ class Adam4EveHistoricalClient:
             List of HistoricalPrice objects
         """
         try:
-            # Map region names to region IDs (The Forge = 10000002)
-            region_mapping = {
-                "The Forge": "10000002",
-                "Domain": "10000043",
-                "Sinq Laison": "10000032",
-                "Heimatar": "10000030",
-                "Metropolis": "10000042"
-            }
-            
-            region_id = region_mapping.get(region, "10000002")  # Default to The Forge
-            
-            # Build the contract price URL
-            contract_url = f"{self.BASE_URL}/contract_price.php"
-            params = {
-                'typeID': item_id,
-                'regionID': region_id,
-                'days': days_back
-            }
-            
-            # Add ME/TE filters if specified
-            if me_level is not None:
-                params['me'] = me_level
-            if te_level is not None:
-                params['te'] = te_level
-            
-            self._rate_limit_wait()
-            
-            # Fetch the HTML page
-            response = self.session.get(contract_url, params=params)
-            response.raise_for_status()
+            if html_content is None:
+                html_content = self._get_contract_page_html(item_id, region, days_back)
             
             # Choose the best column for default pricing (highest volume)
-            best_column, best_efficiency = self.get_best_default_column(item_id, days_back)
+            best_column, best_efficiency = self.get_best_default_column(item_id, days_back, html_content)
             
             if best_column is not None:
-                print(f"Using best volume column: {best_efficiency} (column {best_column})")
-                return self._parse_contract_price_html_with_column(item_id, region, best_column)
+                self.logger.debug("Using best volume column %s (column %s)", best_efficiency, best_column)
+                return self._parse_contract_price_html_with_column(item_id, region, best_column, html_content=html_content, days_back=days_back)
             else:
                 # Fallback to original parsing (first available column)
-                return self._parse_contract_price_html(response.text, region)
+                return self._parse_contract_price_html(html_content, region)
             
         except Exception as e:
-            print(f"Error fetching historical data for item {item_id}: {e}")
+            self.logger.warning("Error fetching historical data for item %s: %s", item_id, e)
             return []
+    
+    def _extract_price_table(self, soup: BeautifulSoup) -> Tuple[BeautifulSoup, BeautifulSoup]:
+        """Validate presence of the expected price table and tbody."""
+        price_table = soup.find('table', {'class': 'no_border tablesorter', 'id': 'table'})
+        if not price_table:
+            raise ValueError("Price table not found in Adam4EVE response")
+        
+        tbody = price_table.find('tbody')
+        if not tbody:
+            raise ValueError("Price table missing tbody in Adam4EVE response")
+        
+        return price_table, tbody
     
     def _parse_contract_price_html(self, html_content: str, region: str) -> List[HistoricalPrice]:
         """
@@ -221,22 +239,17 @@ class Adam4EveHistoricalClient:
             soup = BeautifulSoup(html_content, 'html.parser')
             historical_prices = []
             
-            # Find the table with pricing data
-            # Look for table with class "no_border tablesorter" and id "table"
-            price_table = soup.find('table', {'class': 'no_border tablesorter', 'id': 'table'})
-            
-            if not price_table:
-                print("Could not find price table in HTML response")
-                return []
-            
-            # Find the tbody section
-            tbody = price_table.find('tbody')
-            if not tbody:
-                print("Could not find tbody in price table")
+            try:
+                _, tbody = self._extract_price_table(soup)
+            except ValueError as exc:
+                self.logger.warning("%s", exc)
                 return []
             
             # Parse each row of price data
             rows = tbody.find_all('tr', class_='highlight')
+            if not rows:
+                self.logger.warning("No price rows found in Adam4EVE response for region %s", region)
+                return []
             
             for row in rows:
                 cells = row.find_all('td')
@@ -292,10 +305,13 @@ class Adam4EveHistoricalClient:
                                 region=region
                             ))
             
+            if not historical_prices:
+                self.logger.warning("Parsed 0 price points from Adam4EVE response for region %s", region)
+
             return sorted(historical_prices, key=lambda x: x.date, reverse=True)
             
         except Exception as e:
-            print(f"Error parsing HTML content: {e}")
+            self.logger.warning("Error parsing HTML content: %s", e)
             return []
     
     def _parse_price_text(self, price_text: str) -> float:
@@ -338,8 +354,38 @@ class Adam4EveHistoricalClient:
             return price_value * multiplier
             
         except (ValueError, TypeError) as e:
-            print(f"Error parsing price text '{price_text}': {e}")
+            self.logger.debug("Error parsing price text '%s': %s", price_text, e)
             return 0.0
+
+    def _get_region_id(self, region: str) -> str:
+        region_mapping = {
+            "The Forge": "10000002",
+            "Domain": "10000043",
+            "Sinq Laison": "10000032",
+            "Heimatar": "10000030",
+            "Metropolis": "10000042"
+        }
+        return region_mapping.get(region, "10000002")
+
+    def _get_contract_page_html(self, item_id: int, region: str = "The Forge", days_back: int = 30) -> str:
+        """
+        Fetch (and cache) contract_price.php HTML for an item/region/days combo.
+        """
+        region_id = self._get_region_id(region)
+        key = (item_id, region_id, days_back)
+        if key in self._contract_page_cache:
+            return self._contract_page_cache[key]
+        
+        url = f"{self.BASE_URL}/contract_price.php"
+        params = {
+            "typeID": item_id,
+            "regionID": region_id,
+            "days": days_back
+        }
+        response = self._request(url, params=params)
+        html = response.text
+        self._contract_page_cache[key] = html
+        return html
     
     def get_current_market_data(self, item_id: int, region: str = "The Forge") -> Optional[Dict[str, Any]]:
         """
@@ -370,7 +416,7 @@ class Adam4EveHistoricalClient:
             }
             
         except Exception as e:
-            print(f"Error fetching current market data for item {item_id}: {e}")
+            self.logger.warning("Error fetching current market data for item %s: %s", item_id, e)
             return None
     
     def get_regional_comparison(self, item_id: int, regions: List[str]) -> Dict[str, Dict[str, Any]]:
@@ -409,7 +455,7 @@ class Adam4EveHistoricalClient:
         # For now, return empty list as this requires extensive SDE integration
         return []
     
-    def get_efficiency_columns(self, item_id: int) -> Dict[str, int]:
+    def get_efficiency_columns(self, item_id: int, html_content: Optional[str] = None) -> Dict[str, int]:
         """
         Get available efficiency columns from the pricing table.
         
@@ -420,20 +466,15 @@ class Adam4EveHistoricalClient:
             Dictionary mapping efficiency string (e.g., "10/20/1") to column index
         """
         try:
-            self._rate_limit_wait()
+            if html_content is None:
+                html_content = self._get_contract_page_html(item_id)
             
-            url = f"{self.BASE_URL}/contract_price.php"
-            params = {"typeID": item_id}
-            
-            # Use session with headers to mimic browser behavior
-            response = self.session.get(url, params=params)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
+            soup = BeautifulSoup(html_content, 'html.parser')
             
             # Find the price table
             price_table = soup.find('table', {'class': 'no_border tablesorter', 'id': 'table'})
             if not price_table:
+                self.logger.warning("No price table found when fetching efficiency columns for item %s", item_id)
                 return {}
             
             # Get table headers
@@ -467,13 +508,14 @@ class Adam4EveHistoricalClient:
             return efficiency_columns
             
         except Exception as e:
-            print(f"Error getting efficiency columns for item {item_id}: {e}")
+            self.logger.warning("Error getting efficiency columns for item %s: %s", item_id, e)
             return {}
     
     def find_closest_efficiency_match(
         self, 
         item_id: int, 
-        target_efficiency: BPCEfficiency
+        target_efficiency: BPCEfficiency,
+        html_content: Optional[str] = None
     ) -> Tuple[Optional[str], Optional[int]]:
         """
         Find the closest matching efficiency column for the target BPC efficiency.
@@ -485,7 +527,7 @@ class Adam4EveHistoricalClient:
         Returns:
             Tuple of (efficiency_string, column_index) for the closest match, or (None, None) if no match
         """
-        efficiency_columns = self.get_efficiency_columns(item_id)
+        efficiency_columns = self.get_efficiency_columns(item_id, html_content)
         
         if not efficiency_columns:
             return None, None
@@ -519,7 +561,8 @@ class Adam4EveHistoricalClient:
         item_id: int,
         target_efficiency: BPCEfficiency,
         region: str = "The Forge",
-        days_back: int = 30
+        days_back: int = 30,
+        html_content: Optional[str] = None
     ) -> Tuple[List[HistoricalPrice], Optional[str]]:
         """
         Get historical price data for a BPC using the closest matching efficiency column.
@@ -534,24 +577,24 @@ class Adam4EveHistoricalClient:
             Tuple of (price_data, matched_efficiency_string)
         """
         # Find the closest matching efficiency column
-        matched_efficiency, column_index = self.find_closest_efficiency_match(item_id, target_efficiency)
+        matched_efficiency, column_index = self.find_closest_efficiency_match(item_id, target_efficiency, html_content)
         
         if matched_efficiency is None or column_index is None:
-            print(f"No efficiency columns found for item {item_id}")
+            self.logger.warning("No efficiency columns found for item %s", item_id)
             return [], None
         
-        print(f"Target efficiency: {target_efficiency}")
-        print(f"Matched efficiency: {matched_efficiency} (column {column_index})")
-        print(f"Target equivalent runs: {target_efficiency.calculate_equivalent_runs():.2f}")
+        self.logger.debug("Target efficiency: %s", target_efficiency)
+        self.logger.debug("Matched efficiency: %s (column %s)", matched_efficiency, column_index)
+        self.logger.debug("Target equivalent runs: %.2f", target_efficiency.calculate_equivalent_runs())
         matched_eff_obj = BPCEfficiency.parse(matched_efficiency) 
-        print(f"Matched equivalent runs: {matched_eff_obj.calculate_equivalent_runs():.2f}")
+        self.logger.debug("Matched equivalent runs: %.2f", matched_eff_obj.calculate_equivalent_runs())
         
         # Get price data using the matched column
-        prices = self._parse_contract_price_html_with_column(item_id, region, column_index)
+        prices = self._parse_contract_price_html_with_column(item_id, region, column_index, days_back=days_back, html_content=html_content)
         
         return prices, matched_efficiency
     
-    def get_best_default_column(self, item_id: int, days_back: int = 30) -> Tuple[Optional[int], Optional[str]]:
+    def get_best_default_column(self, item_id: int, days_back: int = 30, html_content: Optional[str] = None) -> Tuple[Optional[int], Optional[str]]:
         """
         Find the non-BPO column with the most volume for default pricing.
         
@@ -564,7 +607,7 @@ class Adam4EveHistoricalClient:
         """
         try:
             # Get efficiency columns
-            efficiency_columns = self.get_efficiency_columns(item_id)
+            efficiency_columns = self.get_efficiency_columns(item_id, html_content)
             
             if not efficiency_columns:
                 return None, None
@@ -572,21 +615,14 @@ class Adam4EveHistoricalClient:
             # Analyze volume for each column
             column_volumes = {}
             
-            self._rate_limit_wait()
-            url = f"{self.BASE_URL}/contract_price.php"
-            params = {"typeID": item_id, "days": days_back}
+            if html_content is None:
+                html_content = self._get_contract_page_html(item_id, days_back=days_back)
             
-            response = self.session.get(url, params=params)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            price_table = soup.find('table', {'class': 'no_border tablesorter', 'id': 'table'})
-            
-            if not price_table:
-                return None, None
-            
-            tbody = price_table.find('tbody')
-            if not tbody:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            try:
+                _, tbody = self._extract_price_table(soup)
+            except ValueError as exc:
+                self.logger.warning("%s", exc)
                 return None, None
             
             # Calculate total volume for each efficiency column
@@ -623,20 +659,22 @@ class Adam4EveHistoricalClient:
                     best_efficiency = efficiency_str
                     best_column = efficiency_columns[efficiency_str]
             
-            print(f"Column volumes: {column_volumes}")
-            print(f"Best default column: {best_efficiency} (volume: {best_volume})")
+            self.logger.debug("Column volumes for item %s: %s", item_id, column_volumes)
+            self.logger.debug("Best default column: %s (volume: %s)", best_efficiency, best_volume)
             
             return best_column, best_efficiency
             
         except Exception as e:
-            print(f"Error finding best default column for item {item_id}: {e}")
+            self.logger.warning("Error finding best default column for item %s: %s", item_id, e)
             return None, None
     
     def _parse_contract_price_html_with_column(
         self, 
         item_id: int, 
         region: str, 
-        column_index: int
+        column_index: int,
+        days_back: int = 30,
+        html_content: Optional[str] = None
     ) -> List[HistoricalPrice]:
         """
         Parse contract price HTML using a specific efficiency column.
@@ -650,29 +688,23 @@ class Adam4EveHistoricalClient:
             List of HistoricalPrice objects from the specified column
         """
         try:
-            self._rate_limit_wait()
+            if html_content is None:
+                html_content = self._get_contract_page_html(item_id, region, days_back)
             
-            url = f"{self.BASE_URL}/contract_price.php"
-            params = {"typeID": item_id}
-            
-            response = self.session.get(url, params=params)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
+            soup = BeautifulSoup(html_content, 'html.parser')
             historical_prices = []
             
-            # Find the price table
-            price_table = soup.find('table', {'class': 'no_border tablesorter', 'id': 'table'})
-            if not price_table:
-                return []
-            
-            # Find the tbody section
-            tbody = price_table.find('tbody')
-            if not tbody:
+            try:
+                _, tbody = self._extract_price_table(soup)
+            except ValueError as exc:
+                self.logger.warning("%s", exc)
                 return []
             
             # Parse each row of price data
             rows = tbody.find_all('tr', class_='highlight')
+            if not rows:
+                self.logger.warning("No price rows found for item %s region %s column %s", item_id, region, column_index)
+                return []
             
             for row in rows:
                 cells = row.find_all('td')
@@ -728,8 +760,11 @@ class Adam4EveHistoricalClient:
                                     region=region
                                 ))
             
+            if not historical_prices:
+                self.logger.warning("Parsed 0 price points for item %s region %s column %s", item_id, region, column_index)
+
             return sorted(historical_prices, key=lambda x: x.date, reverse=True)
             
         except Exception as e:
-            print(f"Error parsing price data for item {item_id}, column {column_index}: {e}")
+            self.logger.warning("Error parsing price data for item %s, column %s: %s", item_id, column_index, e)
             return []

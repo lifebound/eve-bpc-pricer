@@ -8,10 +8,12 @@ of Blueprint Copies using Adam4EVE historical pricing data.
 import argparse
 import sys
 import csv
+import logging
 from typing import Optional, List, Dict
 from pathlib import Path
 
 from src.api.adam4eve_historical_client import Adam4EveHistoricalClient
+from src.api.everef_contract_snapshot import EverefContractSnapshot
 from src.valuators.bpc_valuator import BPCValuator
 from src.parsers.csv_parser import BPCCSVParser, validate_bpc_data
 from src.models.bpc import BPC, BPCType, BPCEfficiency
@@ -23,12 +25,13 @@ def main():
         description="Determine fair market value of EVE Online Blueprint Copies using Adam4EVE historical data",
         epilog="""
 Examples:
-  python main.py --create-template                           # Create blank CSV template
-  python main.py --create-sample                             # Create sample CSV with examples  
-  python main.py --test-api "Nyx Blueprint"                  # Test API with specific BPC
+  python main.py --create-template                                   # Create blank CSV template
+  python main.py --create-sample                                     # Create sample CSV with examples  
+  python main.py --test-api "Nyx Blueprint"                          # Test API with specific BPC
   python main.py --test-api "Nyx Blueprint" --bpc-efficiency "10/20/1"  # Test with efficiency matching
-  python main.py --csv my_bpcs.csv                           # Analyze BPCs from CSV file
-  python main.py --csv my_bpcs.csv --output-csv results.csv  # Generate comprehensive CSV output
+  python main.py --csv my_bpcs.csv                                   # Analyze BPCs from CSV file
+  python main.py --csv my_bpcs.csv --output-csv results.csv          # Generate comprehensive CSV output
+  python main.py --csv my_bpcs.csv --log-level INFO                  # Enable more verbose logging
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -99,6 +102,20 @@ Examples:
         help="Valuation method (default: exponential_weighted)"
     )
     
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        default="WARNING",
+        help="Logging verbosity (default: WARNING)"
+    )
+    
+    parser.add_argument(
+        "--use-everef-snapshot",
+        action="store_true",
+        help="Use Everef public-contract snapshot (cached Parquet) for price data when available"
+    )
+    
     # Output options
     parser.add_argument(
         "--output",
@@ -150,6 +167,11 @@ Examples:
     
     args = parser.parse_args()
     
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.WARNING),
+        format="%(levelname)s %(filename)s:%(funcName)s: %(message)s"
+    )
+    
     # Handle sample CSV creation
     if args.create_sample:
         parser_obj = BPCCSVParser()
@@ -174,6 +196,12 @@ Examples:
     try:
         # Initialize API client and valuator with threading support
         api_client = Adam4EveHistoricalClient()
+        try:
+            api_client.check_availability()
+        except Exception:
+            print("Adam4EVE appears to be unavailable (e.g., 404). Please retry later.", file=sys.stderr)
+            sys.exit(1)
+        everef_client = EverefContractSnapshot() if args.use_everef_snapshot else None
         
         # Configure threading based on input size for CSV operations
         if args.csv:
@@ -185,7 +213,7 @@ Examples:
             max_workers = 2
             requests_per_second = 2.0
             
-        valuator = BPCValuator(api_client, max_workers=max_workers, requests_per_second=requests_per_second)
+        valuator = BPCValuator(api_client, max_workers=max_workers, requests_per_second=requests_per_second, snapshot_client=everef_client)
         
         if args.bpc:
             # Single BPC analysis
